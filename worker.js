@@ -1,4 +1,4 @@
-// worker.js - 整合 Telegram Bot 和诈骗数据库管理界面
+// worker.js - 整合 Telegram Bot 和诈骗数据库管理界面 - 支持多媒体消息
 
 export default {
   async fetch(request, env, ctx) {
@@ -21,7 +21,7 @@ export default {
         SECRET, 
         ADMIN_UID, 
         DB: env.DB,
-        ADMIN_PASSWORD // 添加这个到配置中
+        ADMIN_PASSWORD
       });
     } else if (url.pathname === '/registerWebhook') {
       return await registerWebhook(request, url, WEBHOOK, { TOKEN, SECRET });
@@ -120,6 +120,9 @@ async function onUpdate(update, config) {
   if ('message' in update) {
     console.log('处理消息更新');
     await onMessage(update.message, config);
+  } else if ('edited_message' in update) {
+    console.log('处理编辑消息');
+    await onMessage(update.edited_message, config);
   } else {
     console.log('更新中无消息，类型:', Object.keys(update));
   }
@@ -130,7 +133,10 @@ async function onUpdate(update, config) {
  */
 async function onMessage(message, config) {
   console.log('=== 处理消息 ===');
-  console.log('消息来自:', message.from?.username || message.from?.id, '文本:', message.text?.substring(0, 50));
+  console.log('消息ID:', message.message_id);
+  console.log('消息来自:', message.from?.username || message.from?.id, 
+              '用户ID:', message.from?.id);
+  console.log('消息类型:', getMessageType(message));
   
   // 检查是否是管理员
   const isAdmin = message.chat.id.toString() === config.ADMIN_UID;
@@ -165,33 +171,26 @@ async function onMessage(message, config) {
       return await handleCleanupCommand(message, config);
     }
     
+    // 检查是否是命令
+    if (message.text) {
+      const command = message.text.split(' ')[0];
+      if (['/block', '/unblock', '/checkblock'].includes(command)) {
+        return await handleAdminCommand(message, config);
+      }
+    }
+    
+    // 检查是否是回复消息
     if (!message?.reply_to_message) {
       console.log('管理员消息没有回复');
       return await sendMessage({
         chat_id: config.ADMIN_UID,
-        text: '请回复转发的消息来回复用户，或使用命令：\n/block - 屏蔽用户\n/unblock - 解除屏蔽\n/checkblock - 检查屏蔽状态\n/admin - 获取管理界面链接\n/cleanup - 清理旧数据'
+        text: '请回复转发的消息来回复用户，或使用命令：\n/block - 屏蔽用户\n/unblock - 解除屏蔽\n/checkblock - 检查屏蔽状态\n/admin - 获取管理界面链接\n/cleanup - 清理旧数据\n\n💡 提示：您也可以发送图片、视频等多媒体消息回复用户。'
       }, config.TOKEN);
     }
     
     console.log('管理员正在回复消息ID:', message.reply_to_message.message_id);
     
-    // 处理命令
-    if (/^\/block$/.exec(message.text)) {
-      console.log('处理 /block 命令');
-      return handleBlock(message, config);
-    }
-    
-    if (/^\/unblock$/.exec(message.text)) {
-      console.log('处理 /unblock 命令');
-      return handleUnBlock(message, config);
-    }
-    
-    if (/^\/checkblock$/.exec(message.text)) {
-      console.log('处理 /checkblock 命令');
-      return checkBlock(message, config);
-    }
-    
-    // 管理员回复消息给用户（回声功能）
+    // 管理员回复消息给用户（支持文本、图片、视频等多种类型）
     console.log('管理员正在发送回复给用户');
     
     // 获取被回复的转发消息的ID
@@ -213,12 +212,17 @@ async function onMessage(message, config) {
     console.log('发送消息给用户:', guestChatId);
     
     // 发送消息给用户
-    const result = await sendMessage({
-      chat_id: guestChatId,
-      text: message.text || '（管理员发送了一条消息）'
-    }, config.TOKEN);
+    const result = await forwardAdminMessageToUser(message, guestChatId, config.TOKEN);
     
     console.log('发送消息结果:', result.ok ? '成功' : '失败');
+    
+    // 如果发送失败，通知管理员
+    if (!result.ok) {
+      await sendMessage({
+        chat_id: config.ADMIN_UID,
+        text: '⚠️ 发送消息失败：' + (result.description || '未知错误')
+      }, config.TOKEN);
+    }
     
     return result;
   }
@@ -226,6 +230,43 @@ async function onMessage(message, config) {
   // 普通用户消息处理
   console.log('这是用户消息，用户ID:', message.chat.id);
   return handleGuestMessage(message, config);
+}
+
+// 处理管理员命令
+async function handleAdminCommand(message, config) {
+  console.log('=== 处理管理员命令 ===');
+  const command = message.text.split(' ')[0];
+  
+  if (!message?.reply_to_message) {
+    return await sendMessage({
+      chat_id: config.ADMIN_UID,
+      text: '请回复要操作的转发的消息'
+    }, config.TOKEN);
+  }
+  
+  const repliedMessageId = message.reply_to_message.message_id;
+  let guestChatId = await getMsgMap(repliedMessageId, config.DB);
+  
+  if (!guestChatId) {
+    return await sendMessage({
+      chat_id: config.ADMIN_UID,
+      text: '错误：找不到对应的用户。'
+    }, config.TOKEN);
+  }
+  
+  switch (command) {
+    case '/block':
+      return await handleBlock(message, guestChatId, config);
+    case '/unblock':
+      return await handleUnBlock(message, guestChatId, config);
+    case '/checkblock':
+      return await checkBlock(message, guestChatId, config);
+    default:
+      return await sendMessage({
+        chat_id: config.ADMIN_UID,
+        text: '未知命令'
+      }, config.TOKEN);
+  }
 }
 
 // 清理命令处理
@@ -275,6 +316,122 @@ async function handleCleanupCommand(message, config) {
   }
 }
 
+// 将管理员消息转发给用户（支持多种消息类型）
+async function forwardAdminMessageToUser(message, userChatId, token) {
+  const messageType = getMessageType(message);
+  console.log('管理员消息类型:', messageType, '发送给用户:', userChatId);
+  
+  try {
+    switch (messageType) {
+      case 'text':
+        // 纯文本消息
+        return await sendMessage({
+          chat_id: userChatId,
+          text: message.text,
+          parse_mode: message.parse_mode || 'HTML',
+          reply_markup: message.reply_markup
+        }, token);
+        
+      case 'photo':
+        // 图片消息
+        // 获取最大尺寸的图片
+        const largestPhoto = message.photo[message.photo.length - 1];
+        return await sendPhoto({
+          chat_id: userChatId,
+          photo: largestPhoto.file_id,
+          caption: message.caption,
+          parse_mode: message.parse_mode || 'HTML',
+          reply_markup: message.reply_markup
+        }, token);
+        
+      case 'video':
+        // 视频消息
+        return await sendVideo({
+          chat_id: userChatId,
+          video: message.video.file_id,
+          caption: message.caption,
+          parse_mode: message.parse_mode || 'HTML',
+          reply_markup: message.reply_markup
+        }, token);
+        
+      case 'document':
+        // 文件消息
+        return await sendDocument({
+          chat_id: userChatId,
+          document: message.document.file_id,
+          caption: message.caption,
+          parse_mode: message.parse_mode || 'HTML',
+          reply_markup: message.reply_markup
+        }, token);
+        
+      case 'audio':
+        // 音频消息
+        return await sendAudio({
+          chat_id: userChatId,
+          audio: message.audio.file_id,
+          caption: message.caption,
+          parse_mode: message.parse_mode || 'HTML',
+          reply_markup: message.reply_markup
+        }, token);
+        
+      case 'voice':
+        // 语音消息
+        return await sendVoice({
+          chat_id: userChatId,
+          voice: message.voice.file_id,
+          caption: message.caption,
+          parse_mode: message.parse_mode || 'HTML',
+          reply_markup: message.reply_markup
+        }, token);
+        
+      case 'sticker':
+        // 贴纸消息
+        return await sendSticker({
+          chat_id: userChatId,
+          sticker: message.sticker.file_id,
+          reply_markup: message.reply_markup
+        }, token);
+        
+      case 'animation':
+        // GIF动画
+        return await sendAnimation({
+          chat_id: userChatId,
+          animation: message.animation.file_id,
+          caption: message.caption,
+          parse_mode: message.parse_mode || 'HTML',
+          reply_markup: message.reply_markup
+        }, token);
+        
+      default:
+        // 不支持的消息类型，发送提示
+        return await sendMessage({
+          chat_id: userChatId,
+          text: '📨 管理员给您发送了一条消息'
+        }, token);
+    }
+  } catch (error) {
+    console.error('转发管理员消息失败:', error);
+    return { ok: false, description: error.message };
+  }
+}
+
+// 获取消息类型
+function getMessageType(message) {
+  if (message.text) return 'text';
+  if (message.photo) return 'photo';
+  if (message.video) return 'video';
+  if (message.document) return 'document';
+  if (message.audio) return 'audio';
+  if (message.voice) return 'voice';
+  if (message.sticker) return 'sticker';
+  if (message.animation) return 'animation';
+  if (message.location) return 'location';
+  if (message.contact) return 'contact';
+  if (message.poll) return 'poll';
+  if (message.dice) return 'dice';
+  return 'unknown';
+}
+
 async function handleGuestMessage(message, config) {
   let chatId = message.chat.id;
   console.log('处理用户消息，用户ID:', chatId);
@@ -319,20 +476,9 @@ async function handleGuestMessage(message, config) {
   return forwardReq;
 }
 
-async function handleBlock(message, config) {
+async function handleBlock(message, guestChatId, config) {
   console.log('=== 处理屏蔽 ===');
-  const repliedMessageId = message.reply_to_message.message_id;
-  console.log('回复的消息ID:', repliedMessageId);
-  
-  let guestChatId = await getMsgMap(repliedMessageId, config.DB);
-  console.log('找到的用户ID:', guestChatId);
-  
-  if (!guestChatId) {
-    return await sendMessage({
-      chat_id: config.ADMIN_UID,
-      text: '错误：找不到对应的用户。'
-    }, config.TOKEN);
-  }
+  console.log('屏蔽的用户ID:', guestChatId);
   
   if (guestChatId === config.ADMIN_UID) {
     return await sendMessage({
@@ -366,20 +512,9 @@ async function handleBlock(message, config) {
   }, config.TOKEN);
 }
 
-async function handleUnBlock(message, config) {
+async function handleUnBlock(message, guestChatId, config) {
   console.log('=== 处理解除屏蔽 ===');
-  const repliedMessageId = message.reply_to_message.message_id;
-  console.log('回复的消息ID:', repliedMessageId);
-  
-  let guestChatId = await getMsgMap(repliedMessageId, config.DB);
-  console.log('找到的用户ID:', guestChatId);
-
-  if (!guestChatId) {
-    return await sendMessage({
-      chat_id: config.ADMIN_UID,
-      text: '错误：找不到对应的用户。'
-    }, config.TOKEN);
-  }
+  console.log('解除屏蔽的用户ID:', guestChatId);
 
   console.log('开始完全解除屏蔽用户 ' + guestChatId);
   
@@ -449,17 +584,8 @@ async function handleUnBlock(message, config) {
   }, config.TOKEN);
 }
 
-async function checkBlock(message, config) {
+async function checkBlock(message, guestChatId, config) {
   console.log('=== 检查屏蔽状态 ===');
-  const repliedMessageId = message.reply_to_message.message_id;
-  let guestChatId = await getMsgMap(repliedMessageId, config.DB);
-  
-  if (!guestChatId) {
-    return await sendMessage({
-      chat_id: config.ADMIN_UID,
-      text: '错误：找不到对应的用户。'
-    }, config.TOKEN);
-  }
   
   let inBlockedDb = false;
   let inFraudDb = false;
@@ -1679,6 +1805,41 @@ async function forwardMessage(msg, token) {
   return requestTelegram('forwardMessage', token, makeReqBody(msg));
 }
 
+// 发送图片
+async function sendPhoto(msg, token) {
+  return requestTelegram('sendPhoto', token, makeReqBody(msg));
+}
+
+// 发送视频
+async function sendVideo(msg, token) {
+  return requestTelegram('sendVideo', token, makeReqBody(msg));
+}
+
+// 发送文档
+async function sendDocument(msg, token) {
+  return requestTelegram('sendDocument', token, makeReqBody(msg));
+}
+
+// 发送音频
+async function sendAudio(msg, token) {
+  return requestTelegram('sendAudio', token, makeReqBody(msg));
+}
+
+// 发送语音
+async function sendVoice(msg, token) {
+  return requestTelegram('sendVoice', token, makeReqBody(msg));
+}
+
+// 发送贴纸
+async function sendSticker(msg, token) {
+  return requestTelegram('sendSticker', token, makeReqBody(msg));
+}
+
+// 发送动画(GIF)
+async function sendAnimation(msg, token) {
+  return requestTelegram('sendAnimation', token, makeReqBody(msg));
+}
+
 /******************** Webhook 管理函数 ********************/
 
 async function registerWebhook(request, url, webhookPath, config) {
@@ -1698,6 +1859,9 @@ async function registerWebhook(request, url, webhookPath, config) {
 
 /******************** HTML 页面生成函数 ********************/
 
+// getLoginPage 和 getAdminPage 函数保持不变
+// 由于字符限制，这里不重复包含HTML代码部分
+// 这些函数与原始代码相同
 function getLoginPage() {
   return `
 <!DOCTYPE html>
