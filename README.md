@@ -26,10 +26,9 @@
 8. 通过打开`https://xxx.workers.dev/registerWebhook`来注册websoket
 
 ## 使用方法
-- 可以绑定一个域名，在[worker.js](./worker.js)中找到这里`·const hostname = 'your-domain.com';` // 替换为实际域名,方便管理后台
+- 可以绑定一个域名，在[worker.js](./worker.js)中找到这里`·const hostname = 'your-domain.com';` // 替换为绑定域名,方便管理后台
 - 当其他用户给bot发消息，会被转发到bot创建者
-- 用户回复普通文字给转发的消息时，会回复到原消息发送者
-- 用户回复`/block`, `/unblock`, `/checkblock`,`/admin`等命令会执行相关指令，**不会**回复到原消息发送者
+- 创建者回复`/block`, `/unblock`, `/checkblock`,`/admin`等命令会执行相关指令，**不会**回复到原消息发送者
 
 ## 欺诈数据源
 - 文件[fraud.db](./fraud.db)为欺诈数据(来源自身收集)，格式为每行一个uid
