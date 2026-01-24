@@ -1,4 +1,4 @@
-// worker.js - 整合 Telegram Bot 和诈骗数据库管理界面 - 支持多媒体消息
+// worker.js - 整合 Telegram Bot 和诈骗数据库管理界面 - 支持多媒体消息和登录安全
 
 export default {
   async fetch(request, env, ctx) {
@@ -33,6 +33,18 @@ export default {
       return await testDeleteFunctions(env.DB);
     } else if (url.pathname === '/db-stats') {
       return await getDatabaseStats(env.DB);
+    } else if (url.pathname === '/debug-login') {
+      const clientIP = getClientIP(request);
+      const result = await checkLoginAttempts(clientIP, env.DB, ADMIN_PASSWORD);
+      return new Response(JSON.stringify({
+        ip: clientIP,
+        allowed: result.allowed,
+        message: result.message,
+        blockedUntil: result.blockedUntil,
+        timestamp: new Date().toISOString()
+      }, null, 2), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     } else if (url.pathname === '/force-delete-user') {
       const params = new URLSearchParams(url.search);
       const userId = params.get('user_id');
@@ -56,6 +68,19 @@ export default {
       return await handleCleanupAPI(request, env.DB, ADMIN_PASSWORD);
     } else if (url.pathname === '/admin-api/export-ids') {
       return await handleExportIdsAPI(request, env.DB, ADMIN_PASSWORD);
+    } else if (url.pathname === '/admin-api/login-stats') {
+      return await handleLoginStatsAPI(request, env.DB, ADMIN_PASSWORD);
+    } else if (url.pathname === '/admin-api/reset-login-attempts') {
+      const params = new URLSearchParams(url.search);
+      const ip = params.get('ip');
+      const password = params.get('password');
+      if (password === ADMIN_PASSWORD && ip && env.DB) {
+        await resetLoginAttempts(ip, env.DB);
+        return new Response(JSON.stringify({ success: true, message: '已重置登录尝试' }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response('未授权', { status: 401 });
     } else if (url.pathname === '/cleanup') {
       // 公开清理接口（需密码验证）
       const params = new URLSearchParams(url.search);
@@ -72,6 +97,307 @@ export default {
     }
   }
 };
+
+/******************** 登录安全相关函数 ********************/
+
+/**
+ * 获取客户端IP地址
+ */
+function getClientIP(request) {
+  return request.headers.get('CF-Connecting-IP') || 
+         request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() || 
+         'unknown';
+}
+
+/**
+ * 检查登录尝试限制（修复版）
+ */
+async function checkLoginAttempts(ipAddress, DB, password) {
+  try {
+    if (!DB) {
+      return { allowed: true, message: '' }; // 无数据库时不限制
+    }
+    
+    // 获取当前时间戳
+    const now = Math.floor(Date.now() / 1000);
+    
+    // 查询登录尝试记录
+    const attemptRecord = await DB.prepare(
+      'SELECT attempt_count, last_attempt, blocked_until FROM login_attempts WHERE ip_address = ?'
+    ).bind(ipAddress).first();
+    
+    if (!attemptRecord) {
+      return { allowed: true, message: '' };
+    }
+    
+    const { attempt_count, last_attempt, blocked_until } = attemptRecord;
+    
+    console.log(`检查登录尝试: IP=${ipAddress}, 尝试次数=${attempt_count}, 最后尝试=${last_attempt}, 阻止时间=${blocked_until}`);
+    
+    // 如果距离上次尝试超过24小时，重置计数
+    if (now - last_attempt > 24 * 3600) {
+      console.log(`距离上次尝试超过24小时，重置登录尝试计数: IP=${ipAddress}`);
+      await resetLoginAttempts(ipAddress, DB);
+      return { allowed: true, message: '' };
+    }
+    
+    // 检查是否被阻止
+    if (blocked_until > 0) {
+      if (now < blocked_until) {
+        // 还在阻止期内
+        const blockedHours = Math.ceil((blocked_until - now) / 3600);
+        return {
+          allowed: false,
+          message: `密码错误次数过多，请 ${blockedHours} 小时后再试`,
+          blockedUntil: blocked_until
+        };
+      } else {
+        // 阻止期已过，重置计数
+        console.log(`阻止期已过，重置登录尝试: IP=${ipAddress}`);
+        await resetLoginAttempts(ipAddress, DB);
+        return { allowed: true, message: '' };
+      }
+    }
+    
+    // 如果尝试次数达到3次或6次，需要计算阻止时间
+    if (attempt_count >= 3) {
+      // 计算应该被阻止的时间
+      let shouldBlockUntil = 0;
+      
+      if (attempt_count === 3) {
+        // 第一次输错3次：第二天再试（24小时后）
+        shouldBlockUntil = last_attempt + (24 * 3600);
+      } else if (attempt_count >= 6) {
+        // 第二次输错3次：隔两天再试（48小时后）
+        // 超过6次后，每次增加1天
+        const additionalDays = Math.floor((attempt_count - 3) / 3);
+        shouldBlockUntil = last_attempt + ((additionalDays + 1) * 24 * 3600);
+      }
+      
+      if (shouldBlockUntil > 0) {
+        // 更新阻止时间
+        await DB.prepare(
+          'UPDATE login_attempts SET blocked_until = ? WHERE ip_address = ?'
+        ).bind(shouldBlockUntil, ipAddress).run();
+        
+        if (now < shouldBlockUntil) {
+          const blockedHours = Math.ceil((shouldBlockUntil - now) / 3600);
+          return {
+            allowed: false,
+            message: `密码错误次数过多，请 ${blockedHours} 小时后再试`,
+            blockedUntil: shouldBlockUntil
+          };
+        }
+      }
+    }
+    
+    return { allowed: true, message: '' };
+    
+  } catch (error) {
+    console.error('检查登录尝试错误:', error);
+    return { allowed: true, message: '' }; // 出错时允许尝试
+  }
+}
+
+/**
+ * 记录失败的登录尝试（修复版）
+ */
+async function recordFailedAttempt(ipAddress, DB) {
+  try {
+    if (!DB) return;
+    
+    const now = Math.floor(Date.now() / 1000);
+    
+    // 查询现有记录
+    const existing = await DB.prepare(
+      'SELECT id, attempt_count, blocked_until FROM login_attempts WHERE ip_address = ?'
+    ).bind(ipAddress).first();
+    
+    if (existing) {
+      const { attempt_count, blocked_until } = existing;
+      
+      // 检查是否还在阻止期内
+      if (blocked_until > 0 && now < blocked_until) {
+        console.log(`用户仍在阻止期内，不增加尝试次数: IP=${ipAddress}`);
+        return;
+      }
+      
+      // 检查是否超过24小时
+      const lastAttemptResult = await DB.prepare(
+        'SELECT last_attempt FROM login_attempts WHERE ip_address = ?'
+      ).bind(ipAddress).first();
+      
+      if (lastAttemptResult && now - lastAttemptResult.last_attempt > 24 * 3600) {
+        // 超过24小时，重置计数
+        console.log(`超过24小时，重置尝试计数: IP=${ipAddress}`);
+        await DB.prepare(
+          'UPDATE login_attempts SET attempt_count = 1, last_attempt = ?, blocked_until = 0 WHERE ip_address = ?'
+        ).bind(now, ipAddress).run();
+      } else {
+        // 增加尝试次数
+        const newAttemptCount = attempt_count + 1;
+        
+        // 先更新尝试次数
+        await DB.prepare(
+          'UPDATE login_attempts SET attempt_count = ?, last_attempt = ? WHERE ip_address = ?'
+        ).bind(newAttemptCount, now, ipAddress).run();
+        
+        console.log(`增加登录失败尝试: IP=${ipAddress}, 新尝试次数=${newAttemptCount}`);
+      }
+      
+    } else {
+      // 创建新记录（第一次尝试）
+      await DB.prepare(
+        'INSERT INTO login_attempts (ip_address, attempt_count, last_attempt) VALUES (?, ?, ?)'
+      ).bind(ipAddress, 1, now).run();
+      
+      console.log(`创建登录尝试记录: IP=${ipAddress}, 尝试次数=1`);
+    }
+    
+  } catch (error) {
+    console.error('记录失败尝试错误:', error);
+  }
+}
+
+/**
+ * 重置登录尝试次数
+ */
+async function resetLoginAttempts(ipAddress, DB) {
+  try {
+    if (!DB) return;
+    
+    const result = await DB.prepare(
+      'DELETE FROM login_attempts WHERE ip_address = ?'
+    ).bind(ipAddress).run();
+    
+    console.log(`重置登录尝试: IP=${ipAddress}, 删除记录=${result.success ? '成功' : '失败'}`);
+    
+  } catch (error) {
+    console.error('重置登录尝试错误:', error);
+  }
+}
+
+/**
+ * 处理管理界面请求（修复版）
+ */
+async function handleAdminRequest(request, DB, password) {
+  const url = new URL(request.url);
+  const auth = request.headers.get('Authorization');
+  const clientIP = getClientIP(request);
+  
+  console.log(`登录请求: IP=${clientIP}, URL=${url.pathname + url.search}`);
+  
+  // 先检查登录尝试限制
+  const loginCheck = await checkLoginAttempts(clientIP, DB, password);
+  console.log(`登录检查结果: allowed=${loginCheck.allowed}, message=${loginCheck.message}`);
+  
+  if (!loginCheck.allowed) {
+    // 返回登录页面，显示错误信息
+    return new Response(getLoginPage(loginCheck.message, loginCheck.blockedUntil), {
+      headers: { 'Content-Type': 'text/html' }
+    });
+  }
+  
+  // 检查密码（简单验证）
+  const inputPassword = auth && auth.startsWith('Bearer ') ? 
+                        auth.substring(7) : 
+                        url.searchParams.get('password');
+  
+  console.log(`密码检查: 输入=${inputPassword ? '有' : '无'}, 正确=${password}`);
+  
+  if (!inputPassword) {
+    // 没有密码，返回登录页面
+    return new Response(getLoginPage(), {
+      headers: { 'Content-Type': 'text/html' }
+    });
+  }
+  
+  if (inputPassword !== password) {
+    console.log(`密码错误: IP=${clientIP}`);
+    // 记录失败的登录尝试
+    await recordFailedAttempt(clientIP, DB);
+    
+    // 再次检查是否应该阻止（因为尝试次数可能已达到限制）
+    const afterFailCheck = await checkLoginAttempts(clientIP, DB, password);
+    console.log(`错误后检查: allowed=${afterFailCheck.allowed}, message=${afterFailCheck.message}`);
+    
+    if (!afterFailCheck.allowed) {
+      return new Response(getLoginPage(afterFailCheck.message, afterFailCheck.blockedUntil), {
+        headers: { 'Content-Type': 'text/html' }
+      });
+    }
+    
+    // 返回登录页面，显示密码错误
+    return new Response(getLoginPage('密码错误，请重试', null, true), {
+      headers: { 'Content-Type': 'text/html' }
+    });
+  }
+  
+  // 登录成功，重置尝试次数
+  console.log(`登录成功: IP=${clientIP}`);
+  await resetLoginAttempts(clientIP, DB);
+  
+  // 返回管理界面
+  return new Response(getAdminPage(), {
+    headers: { 'Content-Type': 'text/html' }
+  });
+}
+
+/**
+ * 验证管理员身份（修复版）
+ */
+async function verifyAdminAuth(request, DB, password) {
+  try {
+    const clientIP = getClientIP(request);
+    
+    console.log(`API验证请求: IP=${clientIP}, Path=${new URL(request.url).pathname}`);
+    
+    // 检查登录尝试限制
+    const loginCheck = await checkLoginAttempts(clientIP, DB, password);
+    console.log(`API登录检查: allowed=${loginCheck.allowed}`);
+    
+    if (!loginCheck.allowed) {
+      return false;
+    }
+    
+    const auth = request.headers.get('Authorization');
+    if (auth && auth.startsWith('Bearer ')) {
+      const token = auth.substring(7);
+      if (token === password) {
+        // 登录成功，重置尝试次数
+        await resetLoginAttempts(clientIP, DB);
+        console.log(`API验证成功: IP=${clientIP}`);
+        return true;
+      } else {
+        // 记录失败的尝试
+        console.log(`API验证失败: IP=${clientIP}, token=${token ? '有' : '无'}`);
+        await recordFailedAttempt(clientIP, DB);
+        return false;
+      }
+    }
+    
+    // 也支持URL参数
+    const url = new URL(request.url);
+    const urlPassword = url.searchParams.get('password');
+    if (urlPassword === password) {
+      // 登录成功，重置尝试次数
+      await resetLoginAttempts(clientIP, DB);
+      console.log(`API URL验证成功: IP=${clientIP}`);
+      return true;
+    } else if (urlPassword) {
+      // 记录失败的尝试
+      console.log(`API URL验证失败: IP=${clientIP}`);
+      await recordFailedAttempt(clientIP, DB);
+      return false;
+    }
+    
+    console.log(`API验证: 无密码`);
+    return false;
+  } catch (error) {
+    console.error('验证管理员身份错误:', error);
+    return false;
+  }
+}
 
 /******************** Telegram Bot 功能 ********************/
 
@@ -163,7 +489,7 @@ async function onMessage(message, config) {
       console.log('处理 /admin 命令');
       // 注意：我们无法直接获取主机名，所以使用一个默认值
       // 在实际部署中，可以通过环境变量或配置获取
-      const hostname = 'tg.tst.de5.net'; // 需要替换为实际域名
+      const hostname = 'your admin'; // 需要替换为实际域名
       const adminUrl = `https://${hostname}/admin`;
       return await sendMessage({
         chat_id: message.chat.id,
@@ -666,6 +992,13 @@ async function cleanupOldMessages(DB) {
       ).bind(Date.now() - (7 * 24 * 60 * 60 * 1000)).run();
       
       console.log('清理了 ' + (cleanupBlockedResult?.meta?.rows_written || 0) + ' 条无效屏蔽记录');
+      
+      // 清理30天前的登录尝试记录
+      const cleanupLoginResult = await DB.prepare(
+        'DELETE FROM login_attempts WHERE created_at < ?'
+      ).bind(thirtyDaysAgo).run();
+      
+      console.log('清理了 ' + (cleanupLoginResult?.meta?.rows_written || 0) + ' 条旧的登录记录');
     }
     
     // 4. 执行数据库优化（VACUUM）
@@ -1140,6 +1473,7 @@ async function initDatabase(DB) {
     console.log('初始化数据库...');
     if (!DB) return false;
     
+    // 创建核心表
     await DB.prepare(`
       CREATE TABLE IF NOT EXISTS msg_map (
         message_id INTEGER PRIMARY KEY,
@@ -1163,6 +1497,27 @@ async function initDatabase(DB) {
         created_at INTEGER DEFAULT (unixepoch())
       )
     `).run();
+    
+    // 创建登录尝试表（新增）
+    await DB.prepare(`
+      CREATE TABLE IF NOT EXISTS login_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip_address TEXT NOT NULL,
+        attempt_count INTEGER DEFAULT 0,
+        last_attempt INTEGER DEFAULT (unixepoch()),
+        blocked_until INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (unixepoch())
+      )
+    `).run();
+    
+    // 创建索引
+    await DB.prepare('CREATE INDEX IF NOT EXISTS idx_msg_map_chat_id ON msg_map(chat_id)').run();
+    await DB.prepare('CREATE INDEX IF NOT EXISTS idx_msg_map_created_at ON msg_map(created_at)').run();
+    await DB.prepare('CREATE INDEX IF NOT EXISTS idx_blocked_users_is_blocked ON blocked_users(is_blocked)').run();
+    await DB.prepare('CREATE INDEX IF NOT EXISTS idx_blocked_users_updated_at ON blocked_users(updated_at)').run();
+    await DB.prepare('CREATE INDEX IF NOT EXISTS idx_fraud_users_created_at ON fraud_users(created_at)').run();
+    await DB.prepare('CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address)').run();
+    await DB.prepare('CREATE INDEX IF NOT EXISTS idx_login_attempts_blocked ON login_attempts(blocked_until)').run();
     
     console.log('数据库表初始化成功');
     return true;
@@ -1192,6 +1547,11 @@ async function getDatabaseStats(DB) {
       'SELECT MIN(created_at) as oldest, MAX(created_at) as newest, COUNT(*) as total FROM msg_map'
     ).first();
     
+    // 获取登录尝试统计
+    const loginAttemptsStats = await DB.prepare(
+      'SELECT COUNT(*) as total, SUM(CASE WHEN blocked_until > 0 THEN 1 ELSE 0 END) as blocked FROM login_attempts'
+    ).first();
+    
     const stats = {
       fraud_users_count: await DB.prepare('SELECT COUNT(*) as count FROM fraud_users').first().then(r => r.count),
       blocked_users_count: await DB.prepare('SELECT COUNT(*) as count FROM blocked_users WHERE is_blocked = 1').first().then(r => r.count),
@@ -1200,8 +1560,11 @@ async function getDatabaseStats(DB) {
       today_added: todayAddedResult ? todayAddedResult.count : 0,
       msg_oldest: msgAgeStats?.oldest ? new Date(msgAgeStats.oldest).toLocaleString('zh-CN') : '无数据',
       msg_newest: msgAgeStats?.newest ? new Date(msgAgeStats.newest).toLocaleString('zh-CN') : '无数据',
+      login_attempts_total: loginAttemptsStats?.total || 0,
+      login_attempts_blocked: loginAttemptsStats?.blocked || 0,
       recent_blocked_users: await DB.prepare('SELECT chat_id, is_blocked, datetime(updated_at, "unixepoch") as updated_at FROM blocked_users ORDER BY updated_at DESC LIMIT 10').all().then(r => r.results),
       recent_fraud_users: await DB.prepare('SELECT user_id, datetime(created_at, "unixepoch") as created_at FROM fraud_users ORDER BY created_at DESC LIMIT 10').all().then(r => r.results),
+      recent_login_attempts: await DB.prepare('SELECT ip_address, attempt_count, datetime(last_attempt, "unixepoch") as last_attempt, CASE WHEN blocked_until > 0 THEN datetime(blocked_until, "unixepoch") ELSE "未阻止" END as blocked_until FROM login_attempts ORDER BY last_attempt DESC LIMIT 10').all().then(r => r.results),
       last_cleanup_recommended: msgAgeStats?.oldest ? 
         (Date.now() - msgAgeStats.oldest > 30 * 24 * 60 * 60 * 1000) : false
     };
@@ -1307,29 +1670,10 @@ async function initDatabaseRoute(DB) {
 
 /******************** 管理界面相关函数 ********************/
 
-// 处理管理界面请求
-async function handleAdminRequest(request, DB, password) {
-  const url = new URL(request.url);
-  const auth = request.headers.get('Authorization');
-  
-  // 检查密码（简单验证）
-  if (auth !== 'Bearer ' + password && url.searchParams.get('password') !== password) {
-    // 返回登录页面
-    return new Response(getLoginPage(), {
-      headers: { 'Content-Type': 'text/html' }
-    });
-  }
-  
-  // 返回管理界面
-  return new Response(getAdminPage(), {
-    headers: { 'Content-Type': 'text/html' }
-  });
-}
-
 // 处理欺诈用户API - 修改为一次性返回所有数据
 async function handleFraudUsersAPI(request, DB, password) {
   // 验证密码
-  if (!await verifyAdminAuth(request, password)) {
+  if (!await verifyAdminAuth(request, DB, password)) {
     return new Response(JSON.stringify({ error: '未授权' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
@@ -1396,7 +1740,7 @@ async function handleFraudUsersAPI(request, DB, password) {
 // 处理添加用户API
 async function handleAddUserAPI(request, DB, password) {
   // 验证密码
-  if (!await verifyAdminAuth(request, password)) {
+  if (!await verifyAdminAuth(request, DB, password)) {
     return new Response(JSON.stringify({ error: '未授权' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
@@ -1456,7 +1800,7 @@ async function handleAddUserAPI(request, DB, password) {
 // 处理批量添加用户API
 async function handleAddUsersBatchAPI(request, DB, password) {
   // 验证密码
-  if (!await verifyAdminAuth(request, password)) {
+  if (!await verifyAdminAuth(request, DB, password)) {
     return new Response(JSON.stringify({ error: '未授权' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
@@ -1509,10 +1853,68 @@ async function handleAddUsersBatchAPI(request, DB, password) {
   }
 }
 
+// 处理登录统计API
+async function handleLoginStatsAPI(request, DB, password) {
+  // 验证密码
+  if (!await verifyAdminAuth(request, DB, password)) {
+    return new Response(JSON.stringify({ error: '未授权' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  try {
+    if (!DB) {
+      return new Response(JSON.stringify({ error: '数据库未连接' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // 获取登录尝试统计
+    const stats = await DB.prepare(
+      `SELECT 
+        ip_address,
+        attempt_count,
+        datetime(last_attempt, 'unixepoch') as last_attempt,
+        CASE 
+          WHEN blocked_until > 0 THEN datetime(blocked_until, 'unixepoch')
+          ELSE '未阻止'
+        END as blocked_until,
+        CASE 
+          WHEN blocked_until > 0 AND blocked_until > unixepoch() THEN '已阻止'
+          ELSE '正常'
+        END as current_status
+      FROM login_attempts 
+      ORDER BY last_attempt DESC`
+    ).all();
+    
+    const response = {
+      success: true,
+      total: stats.results.length,
+      attempts: stats.results
+    };
+    
+    return new Response(JSON.stringify(response, null, 2), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+    
+  } catch (error) {
+    console.error('获取登录统计错误:', error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 // 处理导出ID API
 async function handleExportIdsAPI(request, DB, password) {
   // 验证密码
-  if (!await verifyAdminAuth(request, password)) {
+  if (!await verifyAdminAuth(request, DB, password)) {
     return new Response(JSON.stringify({ error: '未授权' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
@@ -1556,7 +1958,7 @@ async function handleExportIdsAPI(request, DB, password) {
 // 处理删除用户API
 async function handleDeleteUserAPI(request, DB, password) {
   // 验证密码
-  if (!await verifyAdminAuth(request, password)) {
+  if (!await verifyAdminAuth(request, DB, password)) {
     return new Response(JSON.stringify({ error: '未授权' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
@@ -1619,7 +2021,7 @@ async function handleDeleteUserAPI(request, DB, password) {
 // 处理切换屏蔽状态API
 async function handleToggleBlockAPI(request, DB, password) {
   // 验证密码
-  if (!await verifyAdminAuth(request, password)) {
+  if (!await verifyAdminAuth(request, DB, password)) {
     return new Response(JSON.stringify({ error: '未授权' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
@@ -1675,7 +2077,7 @@ async function handleToggleBlockAPI(request, DB, password) {
 // 处理清理API
 async function handleCleanupAPI(request, DB, password) {
   // 验证密码
-  if (!await verifyAdminAuth(request, password)) {
+  if (!await verifyAdminAuth(request, DB, password)) {
     return new Response(JSON.stringify({ error: '未授权' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' }
@@ -1706,6 +2108,11 @@ async function handleCleanupAPI(request, DB, password) {
       cleanupResult = await DB.prepare(
         'DELETE FROM blocked_users WHERE is_blocked = 0 AND updated_at < ?'
       ).bind(threshold).run();
+    } else if (cleanup_type === 'login_attempts') {
+      // 清理登录尝试记录
+      cleanupResult = await DB.prepare(
+        'DELETE FROM login_attempts WHERE created_at < ?'
+      ).bind(threshold).run();
     } else if (cleanup_type === 'all') {
       // 清理所有旧数据
       const msgResult = await DB.prepare(
@@ -1716,10 +2123,17 @@ async function handleCleanupAPI(request, DB, password) {
         'DELETE FROM blocked_users WHERE is_blocked = 0 AND updated_at < ?'
       ).bind(threshold).run();
       
+      const loginResult = await DB.prepare(
+        'DELETE FROM login_attempts WHERE created_at < ?'
+      ).bind(threshold).run();
+      
       cleanupResult = {
         msg_deleted: msgResult?.meta?.rows_written || 0,
         blocked_deleted: blockedResult?.meta?.rows_written || 0,
-        total_deleted: (msgResult?.meta?.rows_written || 0) + (blockedResult?.meta?.rows_written || 0)
+        login_deleted: loginResult?.meta?.rows_written || 0,
+        total_deleted: (msgResult?.meta?.rows_written || 0) + 
+                      (blockedResult?.meta?.rows_written || 0) + 
+                      (loginResult?.meta?.rows_written || 0)
       };
     }
     
@@ -1745,24 +2159,6 @@ async function handleCleanupAPI(request, DB, password) {
       status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
-  }
-}
-
-// 验证管理员身份
-async function verifyAdminAuth(request, password) {
-  try {
-    const auth = request.headers.get('Authorization');
-    if (auth && auth.startsWith('Bearer ')) {
-      const token = auth.substring(7);
-      return token === password;
-    }
-    
-    // 也支持URL参数
-    const url = new URL(request.url);
-    const urlPassword = url.searchParams.get('password');
-    return urlPassword === password;
-  } catch (error) {
-    return false;
   }
 }
 
@@ -1870,13 +2266,39 @@ async function registerWebhook(request, url, webhookPath, config) {
   });
 }
 
-
 /******************** HTML 页面生成函数 ********************/
 
-// getLoginPage 和 getAdminPage 函数保持不变
-// 由于字符限制，这里不重复包含HTML代码部分
-// 这些函数与原始代码相同
-function getLoginPage() {
+function getLoginPage(errorMessage = null, blockedUntil = null, showPasswordError = false) {
+  let alertHtml = '';
+  
+  if (errorMessage) {
+    alertHtml = `
+      <div class="alert alert-danger" role="alert">
+        <i class="bi bi-exclamation-triangle"></i>
+        ${errorMessage}
+      </div>
+    `;
+  } else if (showPasswordError) {
+    alertHtml = `
+      <div class="alert alert-warning" role="alert">
+        <i class="bi bi-exclamation-triangle"></i>
+        密码错误，请重试
+      </div>
+    `;
+  }
+  
+  // 计算剩余时间（如果有阻止时间）
+  let remainingInfo = '';
+  if (blockedUntil) {
+    const now = Math.floor(Date.now() / 1000);
+    const remainingSeconds = blockedUntil - now;
+    if (remainingSeconds > 0) {
+      const hours = Math.floor(remainingSeconds / 3600);
+      const minutes = Math.floor((remainingSeconds % 3600) / 60);
+      remainingInfo = `<p class="text-danger small mt-2">剩余等待时间: ${hours}小时${minutes}分钟</p>`;
+    }
+  }
+  
   return `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1910,6 +2332,12 @@ function getLoginPage() {
             color: #dc3545;
             margin-bottom: 15px;
         }
+        .security-info {
+            font-size: 0.8rem;
+            color: #666;
+            margin-top: 10px;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -1919,20 +2347,32 @@ function getLoginPage() {
             <h2>诈骗数据库管理</h2>
             <p class="text-muted">请输入密码以继续</p>
         </div>
+        
+        ${alertHtml}
+        
         <form id="loginForm">
             <div class="mb-3">
                 <label for="password" class="form-label">密码</label>
-                <input type="password" class="form-control" id="password" required>
+                <input type="password" class="form-control" id="password" required 
+                       ${blockedUntil ? 'disabled placeholder="账户暂时被锁定"' : ''}>
             </div>
             <div class="d-grid">
-                <button type="submit" class="btn btn-primary">
+                <button type="submit" class="btn btn-primary" ${blockedUntil ? 'disabled' : ''}>
                     <i class="bi bi-box-arrow-in-right"></i> 登录
                 </button>
             </div>
         </form>
-        <div class="alert alert-warning mt-3" role="alert">
-            <i class="bi bi-exclamation-triangle"></i>
-            这是一个受保护的管理界面。请确保您有访问权限。
+        
+        ${remainingInfo}
+        
+        <div class="alert alert-info mt-3" role="alert">
+            <i class="bi bi-exclamation-circle"></i>
+            安全提示：
+            <ul class="mb-0 mt-2">
+                <li>连续输错3次密码，第二天才能再试</li>
+                <li>第二次输错3次，需要隔两天再试</li>
+                <li>请妥善保管密码</li>
+            </ul>
         </div>
     </div>
     
@@ -1949,7 +2389,7 @@ function getLoginPage() {
         // 检查URL中是否已经有密码
         const urlParams = new URLSearchParams(window.location.search);
         const passwordParam = urlParams.get('password');
-        if (passwordParam) {
+        if (passwordParam && !${blockedUntil ? 'true' : 'false'}) {
             document.getElementById('password').value = passwordParam;
             document.getElementById('loginForm').submit();
         }
@@ -1958,6 +2398,7 @@ function getLoginPage() {
 </html>
   `;
 }
+
 
 function getAdminPage() {
   return `
