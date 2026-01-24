@@ -145,7 +145,7 @@ async function onMessage(message, config) {
     console.log('处理 /start 命令');
     return await sendMessage({
       chat_id: message.chat.id,
-      text: '🎉欢迎使用本小秘🎉\n\n1.戒除贪婪，勿信"天上掉馅饼"\n2.信息保密，勿泄个人家人密\n3.提高警惕，勿信不明证件物\n4.及时沟通，勿让骗子钻空子\n5.消息通畅，勿使联络有盲区\n',
+      text: '🎉欢迎使用本小秘🎉\n\n1.戒除贪婪，勿信"天上掉馅饼"\n2.信息保密，勿泄个人家人密\n3.提高警惕，勿信不明证件物\n4.及时沟通，勿让骗子钻空子\n5.消息通畅，勿使联络有盲区\n6.防失联邮箱: a@tct.de5.net',
       parse_mode: 'Markdown'
     }, config.TOKEN);
   }
@@ -154,16 +154,29 @@ async function onMessage(message, config) {
   if (isAdmin) {
     console.log('这是管理员消息');
     
+    // 处理简写命令
+    if (message.text && (message.text === '/a' || message.text === '/A')) {
+      message.text = '/admin';
+    }
+    
     if (message.text === '/admin') {
       console.log('处理 /admin 命令');
       // 注意：我们无法直接获取主机名，所以使用一个默认值
       // 在实际部署中，可以通过环境变量或配置获取
-      const hostname = 'your-domain.com'; // 需要替换为实际域名
+      const hostname = 'tg.tst.de5.net'; // 需要替换为实际域名
       const adminUrl = `https://${hostname}/admin`;
       return await sendMessage({
         chat_id: message.chat.id,
         text: `管理界面: ${adminUrl}\n密码: ${config.ADMIN_PASSWORD || 'admin123'}`
       }, config.TOKEN);
+    }
+    
+    // 处理简写命令
+    if (message.text && (message.text === '/b' || message.text === '/B')) {
+      message.text = '/block';
+    }
+    if (message.text && (message.text === '/u' || message.text === '/U')) {
+      message.text = '/unblock';
     }
     
     if (message.text === '/cleanup') {
@@ -184,7 +197,7 @@ async function onMessage(message, config) {
       console.log('管理员消息没有回复');
       return await sendMessage({
         chat_id: config.ADMIN_UID,
-        text: '请回复转发的消息来回复用户，或使用命令：\n/block - 屏蔽用户\n/unblock - 解除屏蔽\n/checkblock - 检查屏蔽状态\n/admin - 获取管理界面链接\n/cleanup - 清理旧数据\n\n💡 提示：您也可以发送图片、视频等多媒体消息回复用户。'
+        text: '请回复转发的消息来回复用户，或使用命令：\n/b 或 /B - 屏蔽用户\n/u 或 /U - 解除屏蔽\n/a 或 /A - 获取管理界面链接\n/cleanup - 清理旧数据\n/checkblock - 检查屏蔽状态\n\n💡 提示：您也可以发送图片、视频等多媒体消息回复用户。'
       }, config.TOKEN);
     }
     
@@ -1856,6 +1869,7 @@ async function registerWebhook(request, url, webhookPath, config) {
     headers: { 'Content-Type': 'application/json' }
   });
 }
+
 
 /******************** HTML 页面生成函数 ********************/
 
